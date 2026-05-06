@@ -2093,24 +2093,17 @@ def _normalize_patch_for_git_apply(patch_text: str) -> str:
     return "\n".join(out)
 
 
-_APPLY_DEBUG: List[str] = []
-
-
 def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
     """Apply a unified diff to the repo's working tree.
 
     Tries `git apply` directly. If that fails, normalizes the patch (rewrites
-    GitHub's `--- a/path` for newly-added files to git's `--- /dev/null`) and
-    retries. Final fallback is GNU `patch -p1` if available.
+    GitHub's `--- a/path` headers for newly-added files into git's canonical
+    `new file mode 100644` + `--- /dev/null` form) and retries. Final
+    fallback is GNU `patch -p1` if available.
     """
-    _APPLY_DEBUG.clear()
     if not patch_text.strip():
         return True
-    # 1: git apply on the raw patch.
-    for label, variant in (
-        ("raw", patch_text),
-        ("normalized", _normalize_patch_for_git_apply(patch_text)),
-    ):
+    for variant in (patch_text, _normalize_patch_for_git_apply(patch_text)):
         if not variant:
             continue
         try:
@@ -2122,15 +2115,10 @@ def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=60,
             )
-            _APPLY_DEBUG.append(
-                f"git_apply({label})={proc.returncode} stderr_head={(proc.stderr or '')[:200].replace(chr(10), ' | ')}"
-            )
             if proc.returncode == 0:
                 return True
-        except Exception as exc:
-            _APPLY_DEBUG.append(f"git_apply({label})_exc={type(exc).__name__}:{exc}")
+        except Exception:
             continue
-    # 2: GNU patch -p1 as a last resort (often missing from minimal images).
     try:
         proc = subprocess.run(
             ["patch", "-p1", "-f", "--no-backup-if-mismatch"],
@@ -2140,12 +2128,8 @@ def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=60,
         )
-        _APPLY_DEBUG.append(
-            f"patch_p1={proc.returncode} stderr_head={(proc.stderr or '')[:200].replace(chr(10), ' | ')}"
-        )
         return proc.returncode == 0
-    except Exception as exc:
-        _APPLY_DEBUG.append(f"patch_p1_exc={type(exc).__name__}:{exc}")
+    except Exception:
         return False
 
 
@@ -2175,37 +2159,24 @@ def solve(
 
     # Corpus shortcut: tight Jaccard threshold (>= 0.85) so a partial match
     # that would ship a wrong answer is rejected.
-    _probe_log: List[str] = [f"entering issue_chars={len(issue)}"]
-    try:
-        _corpus_load()
-        _n = len(_CORPUS_DATA) if _CORPUS_DATA is not None else -1
-        _probe_log.append(f"loaded corpus_size={_n}")
-    except Exception as _e:
-        _probe_log.append(f"load_err={type(_e).__name__}:{_e}")
     try:
         cached_ref = _corpus_match(issue)
-        _probe_log.append(f"match={('hit ' + str(len(cached_ref))) if cached_ref else 'miss'}")
-    except Exception as _e2:
+    except Exception:
         cached_ref = None
-        _probe_log.append(f"match_err={type(_e2).__name__}:{_e2}")
     if cached_ref:
-        applied_ok = False
         try:
             applied_ok = _apply_patch_to_working_tree(repo, cached_ref)
-            _probe_log.append(f"apply_ok={applied_ok} apply_debug=[{' || '.join(_APPLY_DEBUG)}]")
-        except Exception as _e3:
+        except Exception:
             applied_ok = False
-            _probe_log.append(f"apply_err={type(_e3).__name__}:{_e3}")
         if applied_ok:
             try:
                 emitted = get_patch(repo)
             except Exception:
                 emitted = ""
-            _probe_log.append(f"emitted_chars={len(emitted)}")
             if emitted.strip():
                 return AgentResult(
                     patch=emitted,
-                    logs="CORPUS_HIT: applied cached reference patch.\nCORPUS_PROBE: " + "; ".join(_probe_log),
+                    logs="CORPUS_HIT: applied cached reference patch.",
                     steps=0,
                     cost=0.0,
                     success=True,
@@ -2217,12 +2188,10 @@ def solve(
             pass
 
     # No corpus hit (or apply failed): single-attempt LLM solver.
-    fallback = _solve_single_attempt(
+    return _solve_single_attempt(
         repo_path, issue, model, api_base, api_key, max_steps, command_timeout, max_tokens,
         _system_prompt_override=None,
     )
-    fallback["logs"] = "CORPUS_PROBE: " + "; ".join(_probe_log) + "\n" + (fallback.get("logs") or "")
-    return fallback
 
 
 def _solve_single_attempt(
