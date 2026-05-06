@@ -2027,13 +2027,33 @@ def _restore_repo_state(repo: Path) -> None:
 
 
 def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
-    """Apply a unified diff to the repo's working tree. Used to restore a
-    candidate patch after the multi-attempt cascade picks it as the winner."""
+    """Apply a unified diff to the repo's working tree.
+
+    Tries `git apply` first (strictest, works for git-format diffs). Falls
+    back to GNU `patch -p1` for diffs that use `--- a/path` instead of
+    `--- /dev/null` for newly-added files (the format the validator's
+    public commit.json blob uses).
+    """
     if not patch_text.strip():
         return True
+    # First attempt: git apply (strict).
     try:
         proc = subprocess.run(
             ["git", "apply", "--whitespace=nowarn", "-"],
+            cwd=str(repo),
+            input=patch_text,
+            text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        if proc.returncode == 0:
+            return True
+    except Exception:
+        pass
+    # Fallback: GNU patch -p1 (looser, handles GitHub commit-style diffs).
+    try:
+        proc = subprocess.run(
+            ["patch", "-p1", "-f", "--no-backup-if-mismatch"],
             cwd=str(repo),
             input=patch_text,
             text=True,
