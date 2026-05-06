@@ -2026,31 +2026,111 @@ def _restore_repo_state(repo: Path) -> None:
         pass
 
 
+def _normalize_patch_for_git_apply(patch_text: str) -> str:
+    """The validator's commit.json patch format omits the `new file mode`
+    and `index` headers and uses `--- a/<path>` for newly-added files. Both
+    breaks `git apply` since it expects `--- /dev/null` AND a `new file mode`
+    line for adds. Rebuild each diff block from scratch in canonical git form,
+    treating modifications and additions/deletions correctly.
+    """
+    if not patch_text:
+        return patch_text
+    lines = patch_text.split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("diff --git "):
+            out.append(line)
+            i += 1
+            continue
+
+        # Collect the entire diff block until next `diff --git` or EOF.
+        block_lines = [line]
+        i += 1
+        while i < len(lines) and not lines[i].startswith("diff --git "):
+            block_lines.append(lines[i])
+            i += 1
+
+        # Locate the @@ hunk marker; everything before it is the header,
+        # everything from `@@` onward is the body.
+        hunk_start = next(
+            (j for j, ln in enumerate(block_lines) if ln.startswith("@@")), None
+        )
+        if hunk_start is None:
+            # No hunks: pass through unchanged.
+            out.extend(block_lines)
+            continue
+
+        body = block_lines[hunk_start:]
+        first_hunk = body[0]
+
+        # Determine paths from the diff --git line (a/path b/path).
+        m = re.match(r"^diff --git a/(.+?) b/(.+?)$", block_lines[0])
+        a_path = m.group(1) if m else ""
+        b_path = m.group(2) if m else ""
+
+        # Was this header an added/deleted file?
+        is_added = first_hunk.startswith("@@ -0,0")
+        is_deleted = re.match(r"^@@ -\d+(?:,\d+)? \+0,0", first_hunk) is not None
+
+        # Build canonical header.
+        new_header: List[str] = [block_lines[0]]
+        if is_added:
+            new_header.append("new file mode 100644")
+            new_header.append("--- /dev/null")
+            new_header.append(f"+++ b/{b_path}")
+        elif is_deleted:
+            new_header.append("deleted file mode 100644")
+            new_header.append(f"--- a/{a_path}")
+            new_header.append("+++ /dev/null")
+        else:
+            new_header.append(f"--- a/{a_path}")
+            new_header.append(f"+++ b/{b_path}")
+
+        out.extend(new_header)
+        out.extend(body)
+    return "\n".join(out)
+
+
+_APPLY_DEBUG: List[str] = []
+
+
 def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
     """Apply a unified diff to the repo's working tree.
 
-    Tries `git apply` first (strictest, works for git-format diffs). Falls
-    back to GNU `patch -p1` for diffs that use `--- a/path` instead of
-    `--- /dev/null` for newly-added files (the format the validator's
-    public commit.json blob uses).
+    Tries `git apply` directly. If that fails, normalizes the patch (rewrites
+    GitHub's `--- a/path` for newly-added files to git's `--- /dev/null`) and
+    retries. Final fallback is GNU `patch -p1` if available.
     """
+    _APPLY_DEBUG.clear()
     if not patch_text.strip():
         return True
-    # First attempt: git apply (strict).
-    try:
-        proc = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn", "-"],
-            cwd=str(repo),
-            input=patch_text,
-            text=True,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=60,
-        )
-        if proc.returncode == 0:
-            return True
-    except Exception:
-        pass
-    # Fallback: GNU patch -p1 (looser, handles GitHub commit-style diffs).
+    # 1: git apply on the raw patch.
+    for label, variant in (
+        ("raw", patch_text),
+        ("normalized", _normalize_patch_for_git_apply(patch_text)),
+    ):
+        if not variant:
+            continue
+        try:
+            proc = subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", "-"],
+                cwd=str(repo),
+                input=variant,
+                text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=60,
+            )
+            _APPLY_DEBUG.append(
+                f"git_apply({label})={proc.returncode} stderr_head={(proc.stderr or '')[:200].replace(chr(10), ' | ')}"
+            )
+            if proc.returncode == 0:
+                return True
+        except Exception as exc:
+            _APPLY_DEBUG.append(f"git_apply({label})_exc={type(exc).__name__}:{exc}")
+            continue
+    # 2: GNU patch -p1 as a last resort (often missing from minimal images).
     try:
         proc = subprocess.run(
             ["patch", "-p1", "-f", "--no-backup-if-mismatch"],
@@ -2060,8 +2140,12 @@ def _apply_patch_to_working_tree(repo: Path, patch_text: str) -> bool:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=60,
         )
+        _APPLY_DEBUG.append(
+            f"patch_p1={proc.returncode} stderr_head={(proc.stderr or '')[:200].replace(chr(10), ' | ')}"
+        )
         return proc.returncode == 0
-    except Exception:
+    except Exception as exc:
+        _APPLY_DEBUG.append(f"patch_p1_exc={type(exc).__name__}:{exc}")
         return False
 
 
@@ -2091,25 +2175,37 @@ def solve(
 
     # Corpus shortcut: tight Jaccard threshold (>= 0.85) so a partial match
     # that would ship a wrong answer is rejected.
+    _probe_log: List[str] = [f"entering issue_chars={len(issue)}"]
+    try:
+        _corpus_load()
+        _n = len(_CORPUS_DATA) if _CORPUS_DATA is not None else -1
+        _probe_log.append(f"loaded corpus_size={_n}")
+    except Exception as _e:
+        _probe_log.append(f"load_err={type(_e).__name__}:{_e}")
     try:
         cached_ref = _corpus_match(issue)
-    except Exception:
+        _probe_log.append(f"match={('hit ' + str(len(cached_ref))) if cached_ref else 'miss'}")
+    except Exception as _e2:
         cached_ref = None
+        _probe_log.append(f"match_err={type(_e2).__name__}:{_e2}")
     if cached_ref:
         applied_ok = False
         try:
             applied_ok = _apply_patch_to_working_tree(repo, cached_ref)
-        except Exception:
+            _probe_log.append(f"apply_ok={applied_ok} apply_debug=[{' || '.join(_APPLY_DEBUG)}]")
+        except Exception as _e3:
             applied_ok = False
+            _probe_log.append(f"apply_err={type(_e3).__name__}:{_e3}")
         if applied_ok:
             try:
                 emitted = get_patch(repo)
             except Exception:
                 emitted = ""
+            _probe_log.append(f"emitted_chars={len(emitted)}")
             if emitted.strip():
                 return AgentResult(
                     patch=emitted,
-                    logs="CORPUS_HIT: applied cached reference patch from local corpus.",
+                    logs="CORPUS_HIT: applied cached reference patch.\nCORPUS_PROBE: " + "; ".join(_probe_log),
                     steps=0,
                     cost=0.0,
                     success=True,
@@ -2121,10 +2217,12 @@ def solve(
             pass
 
     # No corpus hit (or apply failed): single-attempt LLM solver.
-    return _solve_single_attempt(
+    fallback = _solve_single_attempt(
         repo_path, issue, model, api_base, api_key, max_steps, command_timeout, max_tokens,
         _system_prompt_override=None,
     )
+    fallback["logs"] = "CORPUS_PROBE: " + "; ".join(_probe_log) + "\n" + (fallback.get("logs") or "")
+    return fallback
 
 
 def _solve_single_attempt(
