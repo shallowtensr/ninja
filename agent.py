@@ -90,7 +90,7 @@ MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
 MAX_CONVERSATION_CHARS = 80000
 MAX_PRELOADED_CONTEXT_CHARS = 32000
-MAX_PRELOADED_FILES = 10
+MAX_PRELOADED_FILES = 12
 MAX_NO_COMMAND_REPAIRS = 3
 MAX_COMMANDS_PER_RESPONSE = 12
 
@@ -755,12 +755,12 @@ def _rank_context_files(repo: Path, issue: str) -> List[str]:
         if relative_path in mentioned:
             score += 100
         if path_lower in issue_lower:
-            score += 35
+            score += 40
         if name_lower and name_lower in issue_lower:
-            score += 24
+            score += 28
         if stem_lower and len(stem_lower) >= 3 and stem_lower in issue_lower:
-            score += 16
-        score += sum(3 for term in terms if term in path_lower)
+            score += 18
+        score += sum(4 for term in terms if term in path_lower)
         if "/test" in path_lower or "spec." in path_lower or ".test." in path_lower:
             score += sum(2 for term in terms if term in path_lower)
         # Boost files whose contents reference identifiers from the issue.
